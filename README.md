@@ -2,105 +2,144 @@
 
 **LLM-powered document extraction for medical bills, with human-in-the-loop review and per-field accuracy scoring.**
 
-LienLens turns unstructured medical bills into structured, reviewable data. A document is uploaded, an LLM extracts key billing fields, and a reviewer confirms or corrects each field in a side-by-side review UI. Every extraction is scored field by field, so model quality is measured rather than assumed.
+LienLens turns unstructured medical bills into structured, reviewable data. A bill is uploaded, an extractor pulls the key billing fields, validation checks flag anything suspicious, and a reviewer confirms or corrects each field side by side with the original document. Every field is scored, so extraction quality is measured instead of assumed.
 
-> **Data notice:** LienLens uses **synthetic medical bills only**. No real PHI is stored or processed. The design still follows PHI-safe practices (access control, encrypted storage, minimal logging of document contents) so it reflects how a production system handling sensitive health data should behave.
+> **Data notice:** LienLens uses **synthetic medical bills only**. No real PHI is stored or processed. The design still follows PHI-safe practices (no document contents in logs, upload limits, a permission switch for authenticated-only access).
+
+![Review screen: original bill beside extracted fields](docs/screenshots/review_guard.png)
 
 ---
 
 ## Why
 
-In personal injury settlements, medical bills and lien correspondence must be reviewed to determine what is owed and to whom. That work is largely manual: staff read inconsistent documents from many providers and re-key the same fields. LienLens explores how LLM extraction plus human review can speed this up without sacrificing accuracy.
+In personal injury settlements, medical bills and lien correspondence have to be reviewed to work out what is owed and to whom. Most of that work is manual: staff read inconsistent documents from many providers and re-key the same fields. LienLens explores how automated extraction plus targeted human review can speed this up **without** giving up accuracy. The key question it answers is: *which fields can a reviewer safely skip?*
 
-## Features
+## What it does
 
-- **Document upload**: PDF and image medical bills, stored in S3
-- **Asynchronous extraction**: uploads enqueue a job on SQS; a worker runs LLM extraction so the API stays responsive
-- **Structured field extraction**:
-  - Provider name and NPI
-  - Patient name (synthetic)
-  - Dates of service
-  - Line items (CPT/HCPCS code, description, billed amount)
-  - Total billed, adjustments, balance due
-- **Human review UI**: document on the left, extracted fields on the right; reviewers accept, edit, or flag each field
-- **Per-field accuracy scoring**: extractions are compared against ground truth for synthetic documents and against reviewer corrections, producing accuracy by field and by document
-- **Failure analysis**: tracks which fields and document layouts the model gets wrong most often (missing values, hallucinated values, format errors)
+- **Upload** PDF bills (drag and drop), stored by Django and rendered as a page preview for review.
+- **Extract** seven billing fields (provider, NPI, patient, date of service, total billed, adjustments, balance due) plus CPT/HCPCS line items.
+  - **LLM extractor** (Anthropic API, forced tool use for schema-shaped JSON) when `ANTHROPIC_API_KEY` is set.
+  - **Rules extractor** (label patterns + regex) otherwise, so the whole app runs offline. It doubles as the baseline the LLM is measured against.
+- **Normalize** values into canonical forms (`$1,234.50` → `1234.50`, `June 11, 2026` → `2026-06-11`).
+- **Validate** every extraction, because well-formed output can still be wrong:
+  - format checks: dates parse, amounts parse, **NPI passes its Luhn checksum**
+  - line items: valid CPT/HCPCS code pattern, numeric amounts
+  - cross-field arithmetic: **line items sum to the total; total − adjustments = balance due**
+- **Route to review**: missing, invalid, arithmetic-failing, or low-confidence fields are flagged. Reviewers can accept all unflagged fields in one click and focus on the flagged ones.
+- **Review**: accept, edit, or flag each field. Corrections are re-validated too: a reviewer's typo that breaks the bill's arithmetic is flagged instead of silently saved.
+- **Score** every field against ground truth (synthetic bills) or the reviewer's decision (uploaded bills), with error types: *missing, wrong value, format error, hallucinated*.
+- **Measure flag recall**: of the fields the extractor got wrong, what share did validation catch? This is the number that tells you whether skipping unflagged fields is safe.
+
+## Results (rules baseline, 12 synthetic bills)
+
+| Layout | What's different | Field accuracy |
+|---|---|---|
+| A | standard labels (`Total Charges`, `Balance Due`) | 100% |
+| B | hospital labels (`Amount You Owe`), long-form dates | 86% |
+| C | terse invoice labels (`Please Pay`, `DOS`), no colons | 29% |
+| **All** | | **71%**, with **100% flag recall** |
+
+The rules extractor collapses on unfamiliar layouts, but every miss is flagged for review, so nothing wrong slips through unseen. Closing the accuracy gap on layouts like C is exactly what the LLM extractor is for; set an API key, run `seed_demo --reset`, and compare.
+
+![Accuracy dashboard](docs/screenshots/accuracy.png)
 
 ## Architecture
 
 ```
-React / TypeScript UI
-        │  REST
+React + TypeScript (Vite)
+        │  REST (JSON)
         ▼
-Django REST Framework API ──► PostgreSQL (documents, fields, reviews, scores)
-        │
-        ├──► S3 (document storage)
-        │
-        └──► SQS (extraction jobs) ──► Extraction worker (Python + LLM)
-                                              │
-                                              └──► writes fields + confidence to PostgreSQL
+Django REST Framework ──► SQLite / PostgreSQL
+        │                 Document · ExtractionRun · ExtractedField · Review
+        ▼
+enqueue_extraction(document)
+        │   (inline in this demo; the seam where SQS + a worker plug in)
+        ▼
+process_document: PDF text (pdfplumber) → extractor (LLM | rules)
+                  → normalize → validate → persist fields + flags
 ```
 
 | Layer | Technology |
 |---|---|
-| Frontend | React, TypeScript |
-| Backend API | Python, Django REST Framework |
-| Database | PostgreSQL |
-| Storage | AWS S3 |
-| Queueing | AWS SQS |
-| Extraction | LLM with structured-output prompting and schema validation |
-| Infrastructure | Docker, docker-compose (local) |
+| Frontend | React 19, TypeScript, React Router, Vite |
+| API | Python, Django, Django REST Framework |
+| Database | SQLite by default, PostgreSQL via env vars |
+| Extraction | pdfplumber text; Anthropic API with tool-use schema, or rule-based fallback |
+| Preview | pypdfium2 renders pages to PNG for the review screen |
+| Test data | reportlab-generated synthetic bills in 3 layouts, with ground truth |
+| CI | GitHub Actions: Django tests, ESLint, TypeScript build |
 
-## How extraction works
+### API
 
-1. A user uploads a bill and the API stores it in S3, creating a `Document` record with status `queued`.
-2. The API publishes an extraction job to SQS.
-3. The worker pulls the job, extracts text from the document, and prompts the LLM to return fields matching a strict JSON schema.
-4. Output is validated: schema checks, type and format checks (dates, currency, CPT code patterns), and arithmetic checks (line items sum to the total).
-5. Fields that fail validation or have low confidence are flagged for human review.
-6. Reviewer corrections are saved and feed accuracy scoring.
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/api/documents/` | list documents with status, fields to review, accuracy |
+| `POST` | `/api/documents/` | upload a PDF (multipart), runs extraction |
+| `GET` | `/api/documents/{id}/` | document with extraction run, fields, validation issues |
+| `DELETE` | `/api/documents/{id}/` | remove a document |
+| `GET` | `/api/documents/{id}/file/` | original PDF |
+| `GET` | `/api/documents/{id}/preview/` | page rendered as PNG |
+| `POST` | `/api/documents/{id}/reextract/` | run extraction again (e.g. after a prompt change) |
+| `POST` | `/api/fields/{id}/review/` | `{"decision": "accept" \| "edit" \| "flag", "corrected_value": "..."}` |
+| `GET` | `/api/metrics/` | accuracy by field, layout, document; error types; flag recall |
+| `GET` | `/api/health/` | status and active extractor |
 
-## Accuracy scoring
+### Data model
 
-For each field, LienLens records:
+- `Document`: file, status (`queued → processing → needs_review → reviewed` / `failed`), optional ground truth
+- `ExtractionRun`: extractor, model, prompt version, latency, line items, validation issues
+- `ExtractedField`: value, confidence, validity, needs-review flag, review state, final value
+- `Review`: decision, corrected value, reviewer, timestamp (an audit trail of every decision)
 
-- **Exact match**, for codes, dates, and amounts
-- **Normalized match**, for names and descriptions (case, whitespace, and punctuation normalized)
-- **Error type**: missing, hallucinated, wrong value, or format error
+## Run it locally
 
-Results roll up into per-field and per-document accuracy, so prompt or model changes can be compared run over run.
+Requirements: Python 3.12+, Node 20+.
 
-## Data model (core)
+```bash
+# 1. Backend
+cd backend
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python manage.py migrate
+python manage.py seed_demo --count 12      # synthetic bills, extracted and scored
+python manage.py runserver                 # http://127.0.0.1:8000
 
-- `Document`: file location, status, uploaded_by, timestamps
-- `ExtractionRun`: model and prompt version, latency, status
-- `ExtractedField`: field name, value, confidence, validation result
-- `Review`: reviewer, corrected value, decision (accept / edit / flag)
-- `FieldScore`: match type, error type, score
+# 2. Frontend (new terminal)
+cd frontend
+npm install
+npm run dev                                # http://localhost:5173
+```
 
-## Security practices
+Open http://localhost:5173. The Vite dev server proxies `/api` to Django.
 
-- Role-based access control on documents and reviews
-- S3 server-side encryption; no document contents written to application logs
-- Synthetic data only; the pipeline is designed so real PHI could be handled under HIPAA-style controls
+**Use the LLM extractor:** `export ANTHROPIC_API_KEY=...` before `runserver` / `seed_demo`. Keys stay on the backend and are never sent to the browser.
 
-## Project status
+**More test bills to upload by hand:** `python manage.py generate_bills --count 6 --out sample_bills`
 
-Active development. This repository is being built out incrementally; see the roadmap below.
+**Tests:** `python manage.py test documents` (18 tests: normalization, NPI checksum, arithmetic checks, both extractors with the LLM client faked, upload validation, the review flow, correction re-validation, metrics).
+
+## Design decisions
+
+- **Validation is separate from extraction.** Both extractors produce the same shape and go through the same checks, so swapping models or prompts never weakens the safety net.
+- **Forced tool use for the LLM.** The model must answer through a JSON schema, which removes free-text parsing failures. Its output is still validated, because a schema-valid answer can be wrong.
+- **Scoring by error type, not just accuracy.** "Missing" and "hallucinated" need different fixes (prompting vs. grounding), so they're tracked separately.
+- **Flag recall over raw accuracy.** In a human-in-the-loop system, the cost of an error depends on whether a person sees it. A 71%-accurate extractor with 100% flag recall is safer than a 95% one that hides its 5%.
+- **One seam for async.** `enqueue_extraction` is the only call site; moving to SQS + a worker means changing that function, not the API or UI.
 
 ## Roadmap
 
-- [ ] Django REST API: document, extraction, and review endpoints
-- [ ] SQS-backed extraction worker
-- [ ] React review UI with side-by-side document viewer
-- [ ] Synthetic medical bill generator with ground-truth labels
-- [ ] Accuracy scoring dashboard
-- [ ] docker-compose for one-command local setup
+- [x] Django REST API: documents, extraction runs, review endpoints
+- [x] Rules extractor + LLM extractor (Anthropic tool use) behind one interface
+- [x] Validation: formats, NPI checksum, CPT codes, cross-field arithmetic
+- [x] React review UI with document preview and accept / edit / flag
+- [x] Synthetic bill generator with ground truth (3 layouts)
+- [x] Accuracy dashboard: per field, per layout, error types, flag recall
+- [ ] Run the LLM extractor across the synthetic set and publish the comparison
+- [ ] SQS-backed extraction worker and S3 document storage
+- [ ] Authentication and role-based access (reviewer vs. admin)
+- [ ] Highlight each extracted value's location on the document preview
 - [ ] Lien correspondence extraction (letters from lienholders)
-
-## Local setup
-
-Setup instructions will be added alongside the docker-compose configuration.
+- [ ] docker-compose for one-command setup
 
 ## Author
 
