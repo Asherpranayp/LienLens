@@ -220,7 +220,7 @@ class PipelineAndApiTests(TestCase):
             )
         run = process_document(doc, llm_client=fake)
         self.assertEqual(run.extractor, "llm")
-        self.assertEqual(fake.calls[0]["tool_choice"]["name"], "record_bill")
+        self.assertEqual(fake.calls[0]["tool_choice"]["type"], "auto")
         self.assertEqual(compute_metrics()["overall"]["accuracy"], 1.0)
         self.assertFalse(run.fields.filter(needs_review=True).exists())
 

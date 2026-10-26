@@ -83,8 +83,8 @@ def extract(text: str, client=None) -> ExtractionResult:
         max_tokens=2000,
         system=SYSTEM_PROMPT,
         tools=[_tool_schema()],
-        tool_choice={"type": "tool", "name": "record_bill"},
-        messages=[{"role": "user", "content": f"<document>\n{text}\n</document>"}],
+        tool_choice={"type": "auto"},
+        messages=[{"role": "user", "content": f"Call the record_bill tool with the extracted fields.\n<document>\n{text}\n</document>"}],
     )
 
     tool_input = next(
